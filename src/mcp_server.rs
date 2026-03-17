@@ -2,9 +2,11 @@ use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use serde_json::{json, Value};
 
 use crate::mcp_adapter::{McpHandler, ServiceToolArgs};
+use crate::mcp_adapter_process::{ProcessMcpHandler, ProcessToolArgs};
 use crate::service_handler::ServiceManager;
+use crate::process_handler::ProcessManager;
 
-pub async fn run_loop(manager: ServiceManager) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_loop(manager: ServiceManager, proc_manager: ProcessManager) -> Result<(), Box<dyn std::error::Error>> {
     let mut stdin = BufReader::new(stdin());
     let mut stdout = stdout();
     let mut line = String::new();
@@ -31,7 +33,7 @@ pub async fn run_loop(manager: ServiceManager) -> Result<(), Box<dyn std::error:
         let method = request.get("method").and_then(|v| v.as_str()).unwrap_or("");
         let params = request.get("params").cloned();
 
-        let response = handle_request(method, params, id, &manager).await;
+        let response = handle_request(method, params, id, &manager, &proc_manager).await;
 
         if let Some(resp) = response {
             let mut resp_str = serde_json::to_string(&resp)?;
@@ -49,6 +51,7 @@ async fn handle_request(
     params: Option<Value>,
     id: Value,
     manager: &ServiceManager,
+    proc_manager: &ProcessManager,
 ) -> Option<Value> {
     match method {
         // Cursor 发来的初始化握手
@@ -78,7 +81,27 @@ async fn handle_request(
                 "jsonrpc": "2.0",
                 "id": id,
                 "result": {
-                    "tools": [{
+                    "tools": [
+                    {
+                        "name": "manage_processes",
+                        "description": "查询和终止 Windows 进程，支持按进程名或 PID 批量操作",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "action": {
+                                    "type": "string",
+                                    "enum": ["list", "kill"],
+                                    "description": "操作类型: list 查询进程列表, kill 终止进程"
+                                },
+                                "processes": {
+                                    "type": "string",
+                                    "description": "进程名或 PID，支持逗号分隔，例如 \"notepad.exe, 1234\"。list 时作为关键字过滤可省略，kill 时必填"
+                                }
+                            },
+                            "required": ["action"]
+                        }
+                    },
+                    {
                         "name": "manage_services",
                         "description": "管理 Windows 服务，支持查询列表、启动和停止服务，可批量操作，支持修改启动类型",
                         "inputSchema": {
@@ -108,7 +131,8 @@ async fn handle_request(
                             },
                             "required": ["action"]
                         }
-                    }]
+                    }
+                    ]
                 }
             }))
         }
@@ -119,6 +143,22 @@ async fn handle_request(
             let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
 
             match tool_name {
+                "manage_processes" => {
+                    let args_value = params.get("arguments").cloned().unwrap_or(Value::Null);
+                    match serde_json::from_value::<ProcessToolArgs>(args_value) {
+                        Ok(args) => {
+                            let result_text = ProcessMcpHandler::handle_call(args, proc_manager);
+                            Some(json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "content": [{ "type": "text", "text": result_text }]
+                                }
+                            }))
+                        }
+                        Err(e) => Some(error_response(id, -32602, &format!("参数解析失败: {}", e))),
+                    }
+                }
                 "manage_services" => {
                     let args_value = params.get("arguments").cloned().unwrap_or(Value::Null);
                     match serde_json::from_value::<ServiceToolArgs>(args_value) {

@@ -1,10 +1,13 @@
 mod service_handler;
 mod logger;
 mod mcp_server;
-mod mcp_adapter; 
+mod mcp_adapter;
+mod process_handler;
+mod mcp_adapter_process;
 
 use clap::{Parser, Subcommand};
 use service_handler::ServiceManager;
+use process_handler::ProcessManager;
 
 #[derive(Parser)]
 #[command(name = "wsm", about = "Windows 服务批量管理工具")]
@@ -41,6 +44,14 @@ enum Commands {
         #[arg(short, long)]
         manual: bool,
     },
+    /// 列出当前运行的进程，支持关键字过滤 (例如: wsm ps chrome)
+    Ps {
+        filter: Option<String>,
+    },
+    /// 终止进程，支持进程名或 PID，支持逗号分隔 (例如: wsm kill notepad,1234)
+    Kill {
+        processes: Vec<String>,
+    },
     Mcp,
 }
 
@@ -55,6 +66,7 @@ async fn main() {
             return;
         }
     };
+    let proc_manager = ProcessManager::new();
 
     match cli.command {
         Commands::List { filter } => {
@@ -78,8 +90,43 @@ async fn main() {
             let expanded_services = expand_services(services);
             process_batch(&manager, expanded_services, false, permanent, manual);
         },
+        Commands::Ps { filter } => {
+            match proc_manager.list_processes(filter.as_deref()) {
+                Ok(list) => print!("{}", proc_manager.format_list(&list)),
+                Err(e) => eprintln!("查询失败: {}", e),
+            }
+        }
+        Commands::Kill { processes } => {
+            let targets: Vec<String> = processes.iter()
+                .flat_map(|s| s.split(','))
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if targets.is_empty() {
+                println!("⚠️ 未输入任何进程名称或 PID");
+                return;
+            }
+            println!("🚀 开始批量终止 {} 个目标...", targets.len());
+            println!("{}", "-".repeat(60));
+            for (target, result) in proc_manager.kill_processes(targets) {
+                match result {
+                    Ok(_) => {
+                        println!("✅ 成功终止: {}", target);
+                        logger::log_action(&target, "PS_KILL", "SUCCESS");
+                    }
+                    Err(e) if e.contains("[PROTECTED]") => {
+                        println!("[ 🛡️  忽略 ] {} — {}", target, e);
+                        logger::log_action(&target, "PS_KILL", "IGNORED (PROTECTED)");
+                    }
+                    Err(e) => {
+                        println!("❌ 失败: {} — {}", target, e);
+                        logger::log_action(&target, "PS_KILL", &format!("FAILED: {}", e));
+                    }
+                }
+            }
+        }
         Commands::Mcp => {
-            if let Err(e) = crate::mcp_server::run_loop(manager).await {
+            if let Err(e) = crate::mcp_server::run_loop(manager, proc_manager).await {
                 eprintln!("MCP Server 错误: {}", e);
             }
         }
